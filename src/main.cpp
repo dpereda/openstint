@@ -24,9 +24,9 @@
 #include <zmq.hpp>
 #include <zmq_addon.hpp>
 
-#include <libhackrf/hackrf.h>
 #include <liquid/liquid.h>
 
+#include "sdr_device.hpp"
 #include "preamble.hpp"
 #include "transponder.hpp"
 #include "frame.hpp"
@@ -34,7 +34,7 @@
 #include "counters.hpp"
 
 
-static hackrf_device* device = nullptr;
+static std::unique_ptr<SdrDevice> sdr_device = nullptr;
 static std::atomic<bool> do_exit(false);
 
 static const uint64_t CENTER_FREQ_HZ       = 5000000ULL;
@@ -101,79 +101,35 @@ bool process_frame(Frame* frame) {
     return false;
 }
 
-// hackrf callback invoked for each block of data
-extern "C" int rx_callback(hackrf_transfer* transfer) {
-    if (do_exit) {
-        return 0;
-    }
-
-    uint64_t buffer_timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()
-    ).count() - startup_ts;
-
-    uint32_t sample_count = transfer->valid_length / 2;
-    const std::complex<int8_t> *samples = reinterpret_cast<const std::complex<int8_t>*>(transfer->buffer);
-    
-    bool frame_detected = false;
-    for (uint32_t idx=0; (idx+SAMPLES_PER_SYMBOL)<=sample_count; idx+=SAMPLES_PER_SYMBOL) {
-        if (frame_parse_mode == FRAME_SEEK) {
-            const std::optional<TransponderType> detected = frame_detector.process_baseband(samples+idx);
-            if (detected) {
-                frame_parse_mode = FRAME_FOUND;
-                frame_detected = true; // do not use this buffer for noisefloor calculation
-                uint64_t timestamp = buffer_timestamp + (1000 * idx) / SAMPLE_RATE;
-                frame = Frame(detected.value(), timestamp, frame_detector.symbol_energy());
-                symbol_reader.read_preamble(&frame, frame_detector.dc_offset(), samples, idx+4);
-            }
-        } else if (frame_parse_mode == FRAME_FOUND) {
-            symbol_reader.read_symbol(&frame, frame_detector.dc_offset(), samples+idx);
-            if (symbol_reader.is_frame_complete(&frame)) {
-                frame_parse_mode = FRAME_SEEK;
-                bool frame_processed = process_frame(&frame);
-                rx_stats.register_frame(frame_processed);
-            }
-        }
-    }
-
-    // save a small section of the buffer
-    // if there is a frame in the next buffer, and read_preamble() must
-    // look back, here save the trailing section of the current buffer
-    symbol_reader.update_reserve_buffer(samples, sample_count);
-
-    // update counters for noise energy and dc offset
-    if (frame_detected) {
-        // there was an actice frame in the buffer, do not update
-        // statistics, as the received data messes with the
-        // noise/dc-offset calculation
-        frame_detector.reset_statistics_counters();
-    } else {
-        frame_detector.update_statistics();
-        rx_stats.save_channel_characteristics(frame_detector.dc_offset(), frame_detector.noise_energy());
-    }
-
-    // Returning 0 indicates "keep going".
-    return 0;
-}    
 
 int main(int argc, char** argv) {
-    int result = HACKRF_SUCCESS;
+    SdrBackend backend = SdrBackend::HackRF;  // Default to HackRF for backward compatibility
 
     const uint64_t freq_hz = CENTER_FREQ_HZ;
     const uint32_t sample_rate = SAMPLE_RATE;
     const uint32_t filter_bw = BB_FILTER_BW;
     uint8_t lna_gain = DEFAULT_LNA_GAIN;
     uint8_t vga_gain = DEFAULT_VGA_GAIN;
+    uint8_t unified_gain = 50;  // 0-100 unified gain for RTL-SDR
     bool bias_tee = false;
     bool amp_enable = false; // hackrf has a custom, +13 dB preamp
     int zmq_port = DEFAULT_ZEROMQ_PORT;
-    const char* hackrf_serial = nullptr;
+    const char* device_serial = nullptr;
 
     // process command line arguments
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
 
-        if (arg == "-d" && i + 1 < argc) {
-            hackrf_serial = argv[++i];
+        if (arg == "-r") {
+            backend = SdrBackend::RTL_SDR;
+        } else if (arg == "-d" && i + 1 < argc) {
+            device_serial = argv[++i];
+        } else if (arg == "-g" && i + 1 < argc) {
+            unified_gain = std::atoi(argv[++i]);
+            if (unified_gain > 100) {
+                std::cerr << "Error: Unified gain must be between 0 and 100.\n";
+                return 1;
+            }
         } else if (arg == "-l" && i + 1 < argc) {
             lna_gain = std::atoi(argv[++i]);
             lna_gain = (lna_gain / 8) * 8; // steps of 8
@@ -200,15 +156,17 @@ int main(int argc, char** argv) {
             if (arg != "-h") {
                 std::cerr << "Unknown argument: " << arg << "\n";
             }
-            std::cerr << "Usage: " << argv[0] << " [-d ser_nr] [-p tcp_port] [-l <0..40>] [-v <0..62>] [-a] [-b] [-m]\n";
-            std::cerr << "\t-d ser_nr   default:first\tserial number of the desired HackRF\n";
+            std::cerr << "Usage: " << argv[0] << " [-r] [-d ser_nr] [-p tcp_port] [-g <0..100>] [-l <0..40>] [-v <0..62>] [-a] [-b] [-m]\n";
+            std::cerr << "\t-r          default:off \tUse RTL-SDR instead of HackRF\n";
+            std::cerr << "\t-d ser_nr   default:first\tserial number of the desired device\n";
             std::cerr << "\t-p port     default:" << DEFAULT_ZEROMQ_PORT << "\tZeroMQ publisher port\n";
-            std::cerr << "\t-l <0..40>  default:" << static_cast<int>(DEFAULT_LNA_GAIN) << "  \tLNA gain (rf signal amplifier; valid values: 0/8/16/24/32/40)\n";
-            std::cerr << "\t-v <0..62>  default:" << static_cast<int>(DEFAULT_LNA_GAIN) << "  \tVGA gain (baseband signal amplifier, steps of 2)\n";
-            std::cerr << "\t-a          default:off \tEnable preamp (+13 dB to input RF signal)\n";
+            std::cerr << "\t-g <0..100> default:50  \tUnified gain (works with both HackRF and RTL-SDR)\n";
+            std::cerr << "\t-l <0..40>  default:" << static_cast<int>(DEFAULT_LNA_GAIN) << "  \tLNA gain [HackRF only] (rf signal amplifier; valid values: 0/8/16/24/32/40)\n";
+            std::cerr << "\t-v <0..62>  default:" << static_cast<int>(DEFAULT_VGA_GAIN) << "  \tVGA gain [HackRF only] (baseband signal amplifier, steps of 2)\n";
+            std::cerr << "\t-a          default:off \tEnable preamp/LNA boost\n";
             std::cerr << "\t-b          default:off \tEnable bias-tee (+3.3 V, 50 mA max)\n";
             std::cerr << "\t-m          default:off \tEnable monitor mode (print received frames to stdout)\n";
-            
+
             return 1;
         }
     }
@@ -224,92 +182,103 @@ int main(int argc, char** argv) {
     publisher.bind(zmq_address);
     std::cout << "Listening on " << zmq_address << std::endl;
 
-    std::cout << "HackRF RX: freq=" << freq_hz << " Hz, sample_rate=" << sample_rate
-              << " Hz, LNA=" << (int)lna_gain << ", VGA=" << (int)vga_gain << "\n";
-
     // install signal handlers
     std::signal(SIGINT, signal_handler);
     std::signal(SIGTERM, signal_handler);
 
-    // init lib
-    result = hackrf_init();
-    if (result != HACKRF_SUCCESS) {
-        std::fprintf(stderr, "hackrf_init() failed: %s (%d)\n", hackrf_error_name(static_cast<enum hackrf_error>(result)), result);
+    // Create SDR device
+    sdr_device = create_sdr_device(backend);
+    if (!sdr_device) {
+        std::cerr << "Failed to create SDR device\n";
         return EXIT_FAILURE;
     }
 
-    // open the first available device
-    result = hackrf_open_by_serial(hackrf_serial, &device);
-    if (result != HACKRF_SUCCESS || device == nullptr) {
-        std::fprintf(stderr, "hackrf_open() failed: %s (%d)\n", hackrf_error_name(static_cast<enum hackrf_error>(result)), result);
-        hackrf_exit();
+    // Initialize SDR device
+    if (!sdr_device->initialize()) {
+        std::cerr << "Failed to initialize " << sdr_device->get_backend_name()
+                  << ": " << sdr_device->get_last_error() << "\n";
         return EXIT_FAILURE;
     }
 
-    read_partid_serialno_t serno;
-    result = hackrf_board_partid_serialno_read(device, &serno);
-    if (result != HACKRF_SUCCESS) {
-        fprintf(stderr, "hackrf_board_partid_serialno_read() failed: %s (%d)\n", hackrf_error_name(static_cast<enum hackrf_error>(result)), result);
-    } else {
-        printf("HackRF SerNo.: %08x%08x%08x%08x\n", serno.serial_no[0], serno.serial_no[1], serno.serial_no[2], serno.serial_no[3]);
+    // Open device
+    if (!sdr_device->open(device_serial)) {
+        std::cerr << "Failed to open device: " << sdr_device->get_last_error() << "\n";
+        return EXIT_FAILURE;
     }
 
-    // set center frequency
-    result = hackrf_set_freq(device, freq_hz);
-    if (result != HACKRF_SUCCESS) {
-        std::fprintf(stderr, "hackrf_set_freq() failed: %s (%d)\n", hackrf_error_name(static_cast<enum hackrf_error>(result)), result);
+    std::cout << "Device: " << sdr_device->get_device_info() << "\n";
+
+    // Define callback lambda
+    auto rx_callback = [&](const std::complex<int8_t>* samples, uint32_t sample_count) {
+        if (do_exit) {
+            return;
+        }
+
+        uint64_t buffer_timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()
+        ).count() - startup_ts;
+
+        bool frame_detected = false;
+        for (uint32_t idx=0; (idx+SAMPLES_PER_SYMBOL)<=sample_count; idx+=SAMPLES_PER_SYMBOL) {
+            if (frame_parse_mode == FRAME_SEEK) {
+                const std::optional<TransponderType> detected = frame_detector.process_baseband(samples+idx);
+                if (detected) {
+                    frame_parse_mode = FRAME_FOUND;
+                    frame_detected = true;
+                    uint64_t timestamp = buffer_timestamp + (1000 * idx) / SAMPLE_RATE;
+                    frame = Frame(detected.value(), timestamp, frame_detector.symbol_energy());
+                    symbol_reader.read_preamble(&frame, frame_detector.dc_offset(), samples, idx+4);
+                }
+            } else if (frame_parse_mode == FRAME_FOUND) {
+                symbol_reader.read_symbol(&frame, frame_detector.dc_offset(), samples+idx);
+                if (symbol_reader.is_frame_complete(&frame)) {
+                    frame_parse_mode = FRAME_SEEK;
+                    bool frame_processed = process_frame(&frame);
+                    rx_stats.register_frame(frame_processed);
+                }
+            }
+        }
+
+        symbol_reader.update_reserve_buffer(samples, sample_count);
+
+        if (frame_detected) {
+            frame_detector.reset_statistics_counters();
+        } else {
+            frame_detector.update_statistics();
+            rx_stats.save_channel_characteristics(frame_detector.dc_offset(), frame_detector.noise_energy());
+        }
+    };
+
+    // Configure SDR device
+    SdrConfig config;
+    config.center_freq_hz = freq_hz;
+    config.sample_rate = sample_rate;
+    config.baseband_filter_bw = filter_bw;
+    config.lna_gain = lna_gain;
+    config.vga_gain = vga_gain;
+    config.unified_gain = unified_gain;
+    config.amp_enable = amp_enable;
+    config.bias_tee = bias_tee;
+    config.device_serial = device_serial;
+
+    if (!sdr_device->configure(config)) {
+        std::cerr << "Failed to configure device: " << sdr_device->get_last_error() << "\n";
         goto cleanup;
     }
 
-    // set sample rate (Hz)
-    result = hackrf_set_sample_rate(device, sample_rate);
-    if (result != HACKRF_SUCCESS) {
-        std::fprintf(stderr, "hackrf_set_sample_rate() failed: %s (%d)\n", hackrf_error_name(static_cast<enum hackrf_error>(result)), result);
-        goto cleanup;
-    }
+    std::cout << sdr_device->get_backend_name() << " RX: freq=" << freq_hz << " Hz, sample_rate=" << sample_rate << " Hz\n";
 
-    // set filter BW (Hz)
-    result = hackrf_set_baseband_filter_bandwidth(device, filter_bw);
-    if (result != HACKRF_SUCCESS) {
-        std::fprintf(stderr, "hackrf_set_baseband_filter_bandwidth() failed: %s (%d)\n", hackrf_error_name(static_cast<enum hackrf_error>(result)), result);
-        goto cleanup;
-    }
 
-    // set LNA gain
-    result = hackrf_set_lna_gain(device, lna_gain);
-    if (result != HACKRF_SUCCESS) {
-        std::fprintf(stderr, "hackrf_set_lna_gain() failed: %s (%d)\n", hackrf_error_name(static_cast<enum hackrf_error>(result)), result);
-    }
-
-    // set VGA gain
-    result = hackrf_set_vga_gain(device, vga_gain);
-    if (result != HACKRF_SUCCESS) {
-        std::fprintf(stderr, "hackrf_set_vga_gain() failed: %s (%d)\n", hackrf_error_name(static_cast<enum hackrf_error>(result)), result);
-    }
-
-    // (Optional) enable amplified antenna
-    hackrf_set_amp_enable(device, amp_enable ? 1 : 0);
-    if (result != HACKRF_SUCCESS) {
-		std::fprintf(stderr, "hackrf_set_amp_enable() failed: %s (%d)\n", hackrf_error_name(static_cast<enum hackrf_error>(result)), result);
-    }
-
-    // (Optional) enable bias-tee
-    result = hackrf_set_antenna_enable(device, bias_tee ? 1 : 0);
-    if (result != HACKRF_SUCCESS) {
-		std::fprintf(stderr, "hackrf_set_antenna_enable() failed: %s (%d)\n", hackrf_error_name(static_cast<enum hackrf_error>(result)), result);
-    }
-
-    // start receiving (callback provides raw interleaved I/Q samples)
-    result = hackrf_start_rx(device, rx_callback, nullptr);
-    if (result != HACKRF_SUCCESS) {
-        std::fprintf(stderr, "hackrf_start_rx() failed: %s (%d)\n", hackrf_error_name(static_cast<enum hackrf_error>(result)), result);
+    // Start receiving
+    if (!sdr_device->start_rx(rx_callback)) {
+        std::cerr << "Failed to start RX: " << sdr_device->get_last_error() << "\n";
         goto cleanup;
     }
 
     std::cerr << "Streaming... stop with Ctrl-C\n";
 
     // main loop — exit when handler sets do_exit (Ctrl-C) or device stops
-    while (!do_exit && hackrf_is_streaming(device) == HACKRF_TRUE) {
+    while (!do_exit && sdr_device->is_streaming()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
         
         const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -354,21 +323,14 @@ int main(int argc, char** argv) {
         }
     }
 
-    // stop RX
-    result = hackrf_stop_rx(device);
-    if (result != HACKRF_SUCCESS) {
-        std::fprintf(stderr, "hackrf_stop_rx() failed: %s (%d)\n", hackrf_error_name(static_cast<enum hackrf_error>(result)), result);
-    }
+    // Stop RX
+    sdr_device->stop_rx();
 
 cleanup:
     std::cout << "cleanup\n";
-    if (device != nullptr) {
-        result = hackrf_close(device);
-        if (result != HACKRF_SUCCESS) {
-            std::fprintf(stderr, "hackrf_close() failed: %s (%d)\n", hackrf_error_name(static_cast<enum hackrf_error>(result)), result);
-        }
+    if (sdr_device) {
+        sdr_device->close();
     }
-    hackrf_exit();
 
     std::cerr << "Done.\n";
     return 0;
