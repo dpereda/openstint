@@ -60,3 +60,9 @@ _deps
 ##### VisualStudioCode
 .vscode/*
 *.code-workspace
+
+##### macOS
+.DS_Store
+
+##### Project specific
+src/openstint
