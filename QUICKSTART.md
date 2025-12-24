@@ -1,18 +1,21 @@
 # OpenStint RTL-SDR Support - Quick Start Guide
 
-**Status:** Implementation Complete ✅
-**Your Hardware:** RTL-SDR Blog V3/V4
-**Date:** December 16, 2024
+**Status:** Implementation Complete ✅  
+**Your Hardware:** RTL-SDR Blog V3/V4  
+**Last Updated:** December 24, 2024
 
 ---
 
 ## What Was Done
 
-✅ Added RTL-SDR support alongside HackRF
-✅ Automatic sample format conversion (unsigned→signed)
-✅ Direct sampling mode for 5 MHz reception
-✅ New `-r` flag to select RTL-SDR
-✅ New `-g` flag for unified gain control (0-100)
+✅ Added RTL-SDR support alongside HackRF  
+✅ Automatic sample format conversion (unsigned→signed)  
+✅ Direct sampling mode for 5 MHz reception (V3) / Upconverter mode (V4)  
+✅ New `-r` flag to select RTL-SDR  
+✅ New `-g` flag for unified gain control (0-100)  
+✅ New `-t` flag for adjustable detection threshold  
+✅ New `-i` flag for IQ inversion (upconverter fix)  
+✅ Offset tuning to avoid DC spike on V4  
 ✅ Full backward compatibility with HackRF
 
 **Result:** 6 new files, 2 modified files, ~625 lines of new code
@@ -70,20 +73,20 @@ make
 # HackRF (default, unchanged)
 ./src/openstint
 
-# RTL-SDR with default gain (50)
+# RTL-SDR with default settings
 ./src/openstint -r
 
-# RTL-SDR with optimal gain (60-70 recommended)
-./src/openstint -r -g 65
+# RTL-SDR Blog V4 with optimal settings
+./src/openstint -r -g 60 -m -t 0.67
 
-# RTL-SDR with bias-tee (for external LNA)
-./src/openstint -r -g 65 -b
+# RTL-SDR with bias-tee (for external LNA/preamp)
+./src/openstint -r -g 60 -b -t 0.67
 
-# RTL-SDR with monitor mode (see frame details)
-./src/openstint -r -g 65 -m
+# RTL-SDR with IQ inversion (if signal is inverted)
+./src/openstint -r -g 60 -m -t 0.67 -i
 
-# RTL-SDR with specific device
-./src/openstint -r -d 00000001
+# RTL-SDR with specific device serial
+./src/openstint -r -d 00000001 -g 60 -t 0.67
 ```
 
 ---
@@ -204,10 +207,11 @@ F AMB T:6173 RSSI:-7.82746 EVM:0.694752 [...]
 
 **Transponder test:**
 ```bash
-./src/openstint -r -g 65 -m
+./src/openstint -r -g 60 -m -t 0.67
 # Place transponder near antenna
-# Should see: "P [timestamp] O [id] ..." for OpenStint
-# Should see: "P [timestamp] L [id] ..." for AMB/RC3
+# Should see: "F AMB" for Legacy/AMB frames
+# Should see: "P [timestamp] L [id] ..." for successful decode
+# EVM should be < 0.40 for reliable decode
 ```
 
 **Both backends test:**
@@ -247,9 +251,15 @@ sudo usermod -a -G plugdev $USER        # Fix permissions (Linux)
 
 ### "Too many false detections"
 ```bash
-./src/openstint -r -g 40               # Decrease gain
-# Move antenna away from interference
+./src/openstint -r -g 60 -t 0.70   # Increase threshold
+# Or decrease gain:
+./src/openstint -r -g 40 -t 0.67
 ```
+
+### "Frames detected but no passings (P lines)"
+- Check EVM values - need < 0.40 for reliable decode
+- Current V4 limitation: frame detection works, but decode may require [OpenStint Preamp](https://github.com/zsellera/openstint-preamp)
+- Check antenna termination resistor is **330-470Ω** (NOT kΩ!)
 
 ---
 
@@ -293,10 +303,12 @@ README.md                - Original OpenStint README
 | **Build** | `cmake . && make` |
 | **HackRF** | `./src/openstint` |
 | **RTL-SDR** | `./src/openstint -r` |
-| **RTL-SDR + gain** | `./src/openstint -r -g 65` |
-| **RTL-SDR + monitor** | `./src/openstint -r -g 65 -m` |
-| **RTL-SDR + bias-tee** | `./src/openstint -r -g 65 -b` |
+| **RTL-SDR V4 optimal** | `./src/openstint -r -g 60 -t 0.67` |
+| **RTL-SDR + monitor** | `./src/openstint -r -g 60 -m -t 0.67` |
+| **RTL-SDR + bias-tee** | `./src/openstint -r -g 60 -b -t 0.67` |
+| **RTL-SDR + IQ invert** | `./src/openstint -r -g 60 -i -t 0.67` |
 | **Help** | `./src/openstint -h` |
+| **ZeroMQ subscriber** | `python integrations/subscriber.py localhost 5556` |
 | **Test RTL-SDR hardware** | `rtl_test` |
 | **Test HackRF hardware** | `hackrf_info` |
 
@@ -304,12 +316,12 @@ README.md                - Original OpenStint README
 
 ## Performance Expectations
 
-| Metric | HackRF | RTL-SDR | Notes |
-|--------|--------|---------|-------|
-| **Detection rate** | 100% | 100% | Should be identical |
-| **RSSI** | Baseline | ±5 dB | RTL may be slightly noisier |
-| **EVM** | < 0.3 | < 0.5 | RTL may be slightly higher |
-| **CPU (RPi3)** | ~40% | ~40% | Should be similar |
+| Metric | HackRF | RTL-SDR V4 | Notes |
+|--------|--------|------------|-------|
+| **Detection rate** | 100% | ~95% | V4 may need preamp for 100% |
+| **RSSI** | Baseline | ±5 dB | V4 upconverter adds some noise |
+| **EVM** | < 0.3 | 0.45-0.60 | V4 needs preamp for < 0.40 |
+| **CPU (RPi3)** | ~40% | ~45% | V4 upsampling adds slight overhead |
 
 ---
 

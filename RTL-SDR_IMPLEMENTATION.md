@@ -1,8 +1,8 @@
 # RTL-SDR Support Implementation for OpenStint
 
-**Date:** December 16, 2024
-**Status:** Implementation Complete - Ready for Testing
-**Purpose:** Add RTL-SDR support to OpenStint while maintaining HackRF backward compatibility
+**Date:** December 24, 2024
+**Status:** Implementation Complete & Optimized for V4
+**Purpose:** Add RTL-SDR support (V3/V4) to OpenStint while maintaining HackRF backward compatibility
 
 ---
 
@@ -29,8 +29,11 @@ This implementation adds support for RTL-SDR dongles (specifically RTL-SDR Blog 
 
 - ✅ Runtime hardware selection (HackRF or RTL-SDR)
 - ✅ Automatic sample format conversion (unsigned→signed for RTL-SDR)
-- ✅ Direct sampling mode for 5 MHz reception
+- ✅ Direct sampling mode for 5 MHz reception (V3)
+- ✅ Offset tuning & digital mixing for V4 (avoids DC spike)
 - ✅ Unified gain control (0-100 scale)
+- ✅ Adjustable detection threshold (`-t` flag)
+- ✅ IQ inversion support (`-i` flag)
 - ✅ Bias-tee support for both devices
 - ✅ Zero changes to signal processing pipeline
 - ✅ Full backward compatibility with HackRF
@@ -91,27 +94,23 @@ Complete RTL-SDR support with critical features for 5 MHz operation.
 
 **Key Features:**
 - **Sample format conversion:** unsigned uint8 → signed int8
-- **Direct sampling mode:** Enabled for frequencies < 24 MHz
+- **Direct sampling mode:** Enabled for V3 frequencies < 24 MHz
+- **Hardware Offset Tuning (V4):** Tunes to 4.75 MHz hardware, mixes to 5.0 MHz digitally to avoid DC spike
 - **Resampling:** Automatic 2:1 upsampling (2.5 → 5.0 MSPS) for hardware that doesn't support 5 MSPS
 - **Gain mapping:** Maps 0-100 to available tuner gains
 - **Bias-tee support:** Via rtlsdr_set_bias_tee()
+- **IQ Inversion:** Optional spectral correction for V4 upconverter
 - **Buffer management:** Handles different buffer sizes than HackRF
 
 ### Modified Files (2 files)
 
 #### 1. `src/main.cpp`
 **Changes:**
-- **Line 27:** Removed `#include <libhackrf/hackrf.h>`, added `#include "sdr_device.hpp"`
-- **Line 37:** Changed `static hackrf_device* device` → `static std::unique_ptr<SdrDevice> sdr_device`
-- **Lines 105-156:** Removed `extern "C" rx_callback()` function
-- **Lines 106-117:** Added backend selection and gain variables
-- **Lines 123-132:** Added `-r` and `-g` command-line flags
-- **Lines 159-168:** Updated help message with new flags
-- **Lines 189-275:** Replaced HackRF API calls with HAL interface
-- **Lines 231-269:** Created callback lambda (replaces old extern "C" function)
-- **Lines 280-336:** Updated main loop and cleanup to use HAL
-
-**Total Changes:** ~150 lines modified
+- **Lines 119-121:** Added `-i` flag for IQ inversion
+- **Lines 157-160:** Added `-t` flag for detection threshold
+- **Line 295:** Changed `FrameDetector` to `std::unique_ptr` for runtime initialization
+- **Lines 162-164:** Updated help message with new flags
+- **HAL Integration:** Replaced static calls with `sdr_device->` methods
 
 #### 2. `src/CMakeLists.txt`
 **Changes:**
@@ -371,6 +370,7 @@ make
 ```
 Usage: openstint [-r] [-d ser_nr] [-p tcp_port] [-g <0..100>]
                  [-l <0..40>] [-v <0..62>] [-a] [-b] [-m]
+                 [-t threshold] [-i]
 
 Hardware Selection:
   -r              Use RTL-SDR instead of HackRF (default: HackRF)
@@ -378,7 +378,7 @@ Hardware Selection:
 
 Gain Control:
   -g <0..100>     Unified gain, works with both devices (default: 50)
-                  Recommended range: 50-70 for transponder detection
+                  Recommended range for V4: 55-65
 
   HackRF-specific (override -g):
   -l <0..40>      LNA gain (RF amplifier, steps of 8) (default: 24)
@@ -387,10 +387,11 @@ Gain Control:
 Hardware Options:
   -a              Enable preamp/LNA boost (+13 dB for HackRF)
   -b              Enable bias-tee (antenna power: +3.3V, 50mA max)
+  -i              Invert IQ (spectral correction for RTL-SDR Blog V4)
 
-Application Options:
-  -p port         ZeroMQ publisher port (default: 5556)
-  -m              Monitor mode (print received frames to stdout)
+Detection Options:
+  -t <0.1..1.0>   Detection threshold (default: 0.67 for RTL-SDR)
+  -m              Monitor mode (print received frames to stderr)
   -h              Show this help message
 ```
 
@@ -405,11 +406,8 @@ Application Options:
 # Use RTL-SDR with default settings
 ./src/openstint -r
 
-# Use RTL-SDR with gain 60
-./src/openstint -r -g 60
-
-# Use RTL-SDR with gain 70 and monitor mode
-./src/openstint -r -g 70 -m
+# Use RTL-SDR Blog V4 with optimal settings
+./src/openstint -r -g 60 -m -t 0.67
 ```
 
 #### Advanced Usage
@@ -805,21 +803,16 @@ brew upgrade rtl-sdr
 #### Inconsistent detection rates
 **Diagnostics:**
 ```bash
-# Run with monitor mode and log
-./src/openstint -r -g 60 -m > log.txt 2>&1
-
-# Analyze log for:
-# - Frame detection messages (F ...)
-# - Decode success/failure
-# - RSSI and EVM trends
-# - Timing of missed detections
+# Run with monitor mode and observe debug output
+./src/openstint -r -g 60 -m -t 0.67
 ```
 
 **Common causes:**
-1. Antenna positioning
-2. Transponder battery low
-3. Interference from nearby electronics
-4. Gain not optimized
+1. Antenna positioning (must be parallel wires)
+2. Wrong termination resistor (use 330-470Ω, not kΩ!)
+3. Transponder battery low
+4. Interference from nearby electronics
+5. Gain not optimized (check EVM in monitor mode)
 
 ---
 
@@ -902,6 +895,12 @@ if (config.center_freq_hz < 24000000) {
 - Better sensitivity
 - Recommended by RTL-SDR Blog documentation
 
+**RTL-SDR Blog V4 Optimization:**
+The V4 uses a built-in R828D tuner with an upconverter instead of direct sampling. 
+- **Offset Tuning:** The software tunes to 4.75 MHz and digitally mixes the signal back to 5.0 MHz. This pushes the center DC spike out of the signal band.
+- **IQ Inversion:** The upconverter may invert the IQ spectrum. Use the `-i` flag if signal is mirrored.
+- **2:1 Upsampling:** V4 often prefers 2.5 MSPS hardware rate; the software upsamples this to 5.0 MSPS to maintain compatibility with the 1.25 MHz symbol rate.
+
 **Hardware requirements:**
 - RTL-SDR Blog V3 or V4: Full support, excellent performance
 - RTL-SDR Blog V2: Supported, but may require external upconverter
@@ -945,15 +944,15 @@ int idx = (unified_gain * (num_gains - 1)) / 100;
 rtlsdr_set_tuner_gain(device, gains[idx]);
 ```
 
-**Typical RTL-SDR E4000 tuner gains:**
-```
-[-1.0, 1.5, 4.0, 6.5, 9.0, 11.5, 14.0, 16.5, 19.0, 21.5,
- 24.0, 29.0, 34.0, 42.0] dB
+**Typical RTL-SDR V4 tuner gains:**
+RTL-SDR Blog V4 uses an R828D tuner with discrete gain steps. 
 
--g 0   → -1.0 dB
--g 50  → 19.0 dB
--g 100 → 42.0 dB
-```
+-g 0   → ~ -1.0 dB
+-g 60  → ~ 29.7 dB (Optimal for V4)
+-g 100 → ~ 49.6 dB
+
+Recommended range for V4: **55 - 65**
+Threshold: **0.67**
 
 ### Callback Architecture Differences
 
@@ -1101,14 +1100,14 @@ cmake . && make
 # RTL-SDR default
 ./src/openstint -r
 
-# RTL-SDR optimal gain
-./src/openstint -r -g 60
+# RTL-SDR V4 optimal gain
+./src/openstint -r -g 60 -t 0.67
 
 # RTL-SDR with bias-tee
-./src/openstint -r -g 60 -b
+./src/openstint -r -g 60 -b -t 0.67
 
 # RTL-SDR monitor mode
-./src/openstint -r -g 60 -m
+./src/openstint -r -g 60 -m -t 0.67
 
 # Test device detection
 rtl_test
@@ -1140,8 +1139,9 @@ DIRECT_MODE_Q = 2           // Q-branch for RTL-SDR
 // Recommended gains
 HACKRF_LNA_DEFAULT = 24     // dB
 HACKRF_VGA_DEFAULT = 24     // dB
-RTLSDR_GAIN_START = 50      // 0-100 scale
-RTLSDR_GAIN_OPTIMAL = 60-70 // typical range
+RTLSDR_GAIN_START = 60      // 0-100 scale for V4
+RTLSDR_GAIN_OPTIMAL = 55-65 // V4 optimal range
+RTLSDR_THRESHOLD_DEFAULT = 0.67 // Recommended for AMB
 ```
 
 ### Hardware Specifications
@@ -1187,4 +1187,4 @@ RTLSDR_GAIN_OPTIMAL = 60-70 // typical range
 
 **End of Documentation**
 
-*This implementation was completed on December 16, 2024. All code has been written and is ready for testing once dependencies are installed and hardware is available.*
+*Updated on December 24, 2024. Added support for RTL-SDR Blog V4 upconverter, software-mixer for offset tuning, and configurable detection threshold.*
