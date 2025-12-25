@@ -1,8 +1,16 @@
 #include "sdr_rtlsdr.hpp"
+
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <format>
+#include <iostream>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+#include <liquid/liquid.h>
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -144,9 +152,11 @@ bool SdrRTLSDR::configure(const SdrConfig &config) {
     if (upsampler) {
       resamp_crcf_destroy(upsampler);
     }
-    // Narrow bandwidth to 0.45 / upsample_rate to suppress imaging artifacts
+    // Use a wider bandwidth (0.49/rate) closer to Nyquist (0.5) to avoid
+    // excessive filtering This approximates the "default" behavior requested by
+    // the creator resamp_crcf_create(rate, m, fc, as, npfb)
     upsampler =
-        resamp_crcf_create(upsample_rate, m, 0.45f / upsample_rate, as, 32);
+        resamp_crcf_create(upsample_rate, m, 0.49f / upsample_rate, as, 32);
   } else {
     // success at native rate, clean up any old resampler
     if (upsampler) {
