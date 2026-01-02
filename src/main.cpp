@@ -108,6 +108,13 @@ bool process_frame(Frame *frame) {
                    "(1:Trail, 2:Status)\n",
                    transponder_id, status, fail_reason);
 
+      // Diagnostic: Dump raw softbits BEFORE Viterbi decode
+      std::fprintf(stderr, "[RAW 80 softbits] ");
+      for (int i = 0; i < 80; i++) {
+        std::fprintf(stderr, "%02X ", softbits[i]);
+      }
+      std::fprintf(stderr, "\n");
+
       // Diagnostic: Try RC4 decode on the SAME softbits if Legacy fails
       if (decode_rc4(softbits, &transponder_id)) {
         // We'll use this for dumping later
@@ -116,6 +123,15 @@ bool process_frame(Frame *frame) {
     break;
   }
   case TransponderType::RC4: {
+    // Dump raw softbits BEFORE Viterbi decode
+    if (monitor_mode) {
+      std::fprintf(stderr, "[RC4 RAW softbits] ");
+      for (int i = 0; i < 80 && i < static_cast<int>(frame->softbits.size());
+           i++) {
+        std::fprintf(stderr, "%02X ", softbits[i]);
+      }
+      std::fprintf(stderr, "\n");
+    }
     if (decode_rc4(softbits, &transponder_id)) {
       // Future: append to passing detector
     }

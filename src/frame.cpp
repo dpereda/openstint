@@ -135,10 +135,12 @@ FrameDetector::process_baseband(const std::complex<int8_t> *samples) {
   // run matchers
   float score_os = buffers[idx].match_preamble(p_openstint);
   float score_leg = buffers[idx].match_preamble(p_legacy);
+  float score_rc4 = buffers[idx].match_preamble(p_rc4);
 
   // Debug: Track max correlation score
-  if (score_os > max_corr_score || score_leg > max_corr_score) {
-    max_corr_score = std::max(score_os, score_leg);
+  float max_score = std::max({score_os, score_leg, score_rc4});
+  if (max_score > max_corr_score) {
+    max_corr_score = max_score;
   }
   debug_sample_count++;
 
@@ -154,6 +156,10 @@ FrameDetector::process_baseband(const std::complex<int8_t> *samples) {
 
   if (score_os > threshold) {
     return TransponderType::OpenStint;
+  }
+  if (score_rc4 > threshold) {
+    return TransponderType::RC4; // Check RC4 before Legacy since RC4 preamble
+                                 // is more specific
   }
   if (score_leg > threshold) {
     return TransponderType::Legacy;

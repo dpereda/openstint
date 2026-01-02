@@ -122,30 +122,34 @@ int decode_legacy(const uint8_t *softbits, uint32_t *transponder_id) {
 }
 
 int decode_rc4(const uint8_t *softbits, uint32_t *transponder_id) {
-  // Pure RC4 Diagnostic Decoder
-  // Uses K=7, r=1/2 Viterbi with NASA polynomials (Standard for libfec
-  // viterbi27)
-  uint8_t decoded[18]; // 144 bits = 18 bytes
+  // RC4 Fingerprint-based decoder
+  // Instead of decoding the actual ID (which is scrambled with unknown PN),
+  // we extract a fingerprint from the raw softbits. Each transponder produces
+  // a unique fingerprint that can be matched via registration.
 
-  init_viterbi27(viterbi_decoder_k7, 0);
-  update_viterbi27_blk(viterbi_decoder_k7, const_cast<uint8_t *>(softbits),
-                       144 + 8);
-  chainback_viterbi27(viterbi_decoder_k7, decoded, 144, 0);
-
-  // Since we don't have the PN sequence yet, this ID will be "junk"
-  // but it allows the capture logic in main.cpp to see the bits.
-  *transponder_id = (static_cast<uint32_t>(decoded[0]) << 16) |
-                    (static_cast<uint32_t>(decoded[1]) << 8) |
-                    static_cast<uint32_t>(decoded[2]);
-
-  // Diagnostic dump for reverse engineering
-  std::fprintf(stderr, "[DEBUG] RC4 Payload (Decoded Bits): ");
-  for (int i = 0; i < 18; i++) {
-    std::fprintf(stderr, "%02X ", decoded[i]);
+  // Convert first 16 softbits to hard bits (threshold at 0x80)
+  // This forms a 16-bit fingerprint unique to each transponder
+  uint16_t fingerprint = 0;
+  for (int i = 0; i < 16; i++) {
+    fingerprint <<= 1;
+    if (softbits[i] >= 0x80) {
+      fingerprint |= 1;
+    }
   }
-  std::fprintf(stderr, "\n");
 
-  // Return non-zero to indicate "something was captured"
+  // Use fingerprint as the "transponder ID" for now
+  // A more sophisticated system would look up fingerprint in a registration
+  // table
+  *transponder_id = static_cast<uint32_t>(fingerprint);
+
+  // Diagnostic output
+  std::fprintf(stderr,
+               "[DEBUG] RC4 Fingerprint: 0x%04X (binary: ", fingerprint);
+  for (int i = 15; i >= 0; i--) {
+    std::fprintf(stderr, "%d", (fingerprint >> i) & 1);
+  }
+  std::fprintf(stderr, ")\n");
+
   return 1;
 }
 
@@ -156,7 +160,7 @@ TransponderProps transponder_props(TransponderType t) {
   case TransponderType::Legacy:
     return {0x51e4, 80, "AMB"};
   case TransponderType::RC4:
-    return {0x51e4, 320, "RC4"};
+    return {0x7916, 320, "RC4"}; // RC4 preamble from RCHourglass project
   }
   return {0x0000, 0, "UNK"};
 }
