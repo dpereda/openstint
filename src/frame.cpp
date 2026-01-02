@@ -11,7 +11,7 @@
 
 #include "complex_cast.hpp"
 
-#define FRAME_MAX_SYMBOL_SPACE 128
+#define FRAME_MAX_SYMBOL_SPACE 512
 #define PREAMBLE_MAX_BIT_ERRORS 2
 #define STATS_UPDATE_THRESHOLD (1 << 12)
 
@@ -132,11 +132,6 @@ FrameDetector::process_baseband(const std::complex<int8_t> *samples) {
   }
   int idx = std::distance(wes, std::max_element(wes, wes + 4)); // ~maxarg
 
-  // update statistics (sample first element)
-  s1 += samples[0];
-  s2 += mag2s[0];
-  n++;
-
   // run matchers
   float score_os = buffers[idx].match_preamble(p_openstint);
   float score_leg = buffers[idx].match_preamble(p_legacy);
@@ -164,6 +159,22 @@ FrameDetector::process_baseband(const std::complex<int8_t> *samples) {
     return TransponderType::Legacy;
   }
   return std::nullopt;
+}
+
+void FrameDetector::collect_statistics(const std::complex<int8_t> *samples) {
+  // Gated Statistics: Only collect noise/DC if the signal is 'quiet'.
+  // This prevents transponder signals (known or unknown) from corrupting the
+  // noise floor. 10.0 magnitude squared is roughly -32dB from full scale, safe
+  // for background.
+  auto s_raw = samples[0];
+  auto s_centered = s_raw - offset;
+  float mag2 = std::norm(complex_cast<int16_t>(s_centered));
+
+  if (mag2 < 10.0f) {
+    s1 += s_raw;
+    s2 += static_cast<uint32_t>(mag2);
+    n++;
+  }
 }
 
 void FrameDetector::update_statistics() {

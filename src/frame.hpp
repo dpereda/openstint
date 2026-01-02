@@ -70,6 +70,7 @@ public:
 
   std::optional<TransponderType>
   process_baseband(const std::complex<int8_t> *samples);
+  void collect_statistics(const std::complex<int8_t> *samples);
   void update_statistics();
   void reset_statistics_counters();
 

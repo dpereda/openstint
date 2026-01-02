@@ -93,14 +93,34 @@ bool process_frame(Frame *frame) {
       return true;
     }
     break;
-  case TransponderType::Legacy:
-    if (decode_legacy(softbits, &transponder_id)) {
+  case TransponderType::Legacy: {
+    int res = decode_legacy(softbits, &transponder_id);
+    if (res > 0) {
       if (transponder_id < 10000000) { // extra check (7-digit max)
         passing_detector.append(frame, transponder_id);
       }
       return true;
+    } else if (monitor_mode) {
+      int status = (-res) >> 8;
+      int fail_reason = (-res) & 0xFF;
+      std::fprintf(stderr,
+                   "[DEBUG] AMB Decode failed: ID=%u Status=0x%02X Reason=%d "
+                   "(1:Trail, 2:Status)\n",
+                   transponder_id, status, fail_reason);
+
+      // Diagnostic: Try RC4 decode on the SAME softbits if Legacy fails
+      if (decode_rc4(softbits, &transponder_id)) {
+        // We'll use this for dumping later
+      }
     }
     break;
+  }
+  case TransponderType::RC4: {
+    if (decode_rc4(softbits, &transponder_id)) {
+      // Future: append to passing detector
+    }
+    break;
+  }
   }
   return false;
 }
@@ -222,7 +242,8 @@ int main(int argc, char **argv) {
   zmq::context_t context(1);
   zmq::socket_t publisher(context, zmq::socket_type::pub);
   publisher.bind(zmq_address);
-  std::cout << "Listening on " << zmq_address << std::endl;
+  std::cout << "Publisher bound to " << zmq_address
+            << " - Ready for subscribers." << std::endl;
 
   // install signal handlers
   std::signal(SIGINT, signal_handler);
@@ -278,6 +299,11 @@ int main(int argc, char **argv) {
                         frame_detector->symbol_energy());
           symbol_reader.read_preamble(&frame, frame_detector->dc_offset(),
                                       samples, idx + 4);
+        } else {
+          // Only collect statistics if no frame was found in this symbol slot.
+          // This prevents the transponder signal from leaking into the noise
+          // floor.
+          frame_detector->collect_statistics(samples + idx);
         }
       } else if (frame_parse_mode == FRAME_FOUND) {
         symbol_reader.read_symbol(&frame, frame_detector->dc_offset(),
@@ -285,6 +311,10 @@ int main(int argc, char **argv) {
         if (symbol_reader.is_frame_complete(&frame)) {
           frame_parse_mode = FRAME_SEEK;
           bool frame_processed = process_frame(&frame);
+          if (!frame_processed && monitor_mode) {
+            std::fprintf(stderr,
+                         "[DEBUG] Frame dropped: Checksum or CRC failed.\n");
+          }
           rx_stats.register_frame(frame_processed);
         }
       }
@@ -294,7 +324,7 @@ int main(int argc, char **argv) {
 
     if (frame_detected) {
       frame_detector->reset_statistics_counters();
-    } else {
+    } else if (frame_parse_mode == FRAME_SEEK) {
       frame_detector->update_statistics();
       rx_stats.save_channel_characteristics(frame_detector->dc_offset(),
                                             frame_detector->noise_energy());

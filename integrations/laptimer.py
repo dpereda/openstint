@@ -24,6 +24,7 @@ laptime is longer than 2 minutes, do not print anything.
 def main():
     if len(sys.argv) != 3:
         print(f"Usage: {sys.argv[0]} <host> <port>")
+        print(f"Example: {sys.argv[0]} 127.0.0.1 5556")
         sys.exit(1)
 
     host = sys.argv[1]

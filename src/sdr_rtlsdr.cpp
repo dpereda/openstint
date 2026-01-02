@@ -146,17 +146,16 @@ bool SdrRTLSDR::configure(const SdrConfig &config) {
   if (hardware_rate < target_rate) {
     // Initialize resampler (upsample)
     upsample_rate = (float)target_rate / (float)hardware_rate;
-    unsigned int m = 7; // filter semi-length
-    float as = 60.0f;   // stop-band attenuation [dB]
+    unsigned int m = 12; // Higher quality filter semi-length (up from 7)
+    float as = 60.0f;    // stop-band attenuation [dB]
 
     if (upsampler) {
       resamp_crcf_destroy(upsampler);
     }
-    // Use a wider bandwidth (0.49/rate) closer to Nyquist (0.5) to avoid
-    // excessive filtering This approximates the "default" behavior requested by
-    // the creator resamp_crcf_create(rate, m, fc, as, npfb)
+    // Centering bandwidth at exactly the target Nyquist frequency (0.5/rate)
+    // with a longer filter 'm' to minimize ringing and artifacts.
     upsampler =
-        resamp_crcf_create(upsample_rate, m, 0.49f / upsample_rate, as, 32);
+        resamp_crcf_create(upsample_rate, m, 0.50f / upsample_rate, as, 32);
   } else {
     // success at native rate, clean up any old resampler
     if (upsampler) {
