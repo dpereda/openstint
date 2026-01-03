@@ -29,6 +29,7 @@
 #include "frame.hpp"
 #include "passing.hpp"
 #include "preamble.hpp"
+#include "rc4_registry.hpp"
 #include "sdr_device.hpp"
 #include "transponder.hpp"
 
@@ -123,7 +124,7 @@ bool process_frame(Frame *frame) {
     break;
   }
   case TransponderType::RC4: {
-    // Dump raw softbits BEFORE Viterbi decode
+    // Dump raw softbits for debugging if monitor mode is enabled
     if (monitor_mode) {
       std::fprintf(stderr, "[RC4 RAW softbits] ");
       for (int i = 0; i < 80 && i < static_cast<int>(frame->softbits.size());
@@ -132,9 +133,15 @@ bool process_frame(Frame *frame) {
       }
       std::fprintf(stderr, "\n");
     }
-    if (decode_rc4(softbits, &transponder_id)) {
-      // Future: append to passing detector
+    int res = decode_rc4(softbits, &transponder_id);
+    if (res > 0) {
+      // Registered transponder - add to passing detector for lap timing
+      if (transponder_id < 10000000) { // extra check (7-digit max)
+        passing_detector.append(frame, transponder_id);
+      }
+      return true;
     }
+    // res == 0 means unregistered - already logged by decode_rc4
     break;
   }
   }
@@ -157,6 +164,12 @@ int main(int argc, char **argv) {
   int zmq_port = DEFAULT_ZEROMQ_PORT;
   const char *device_serial = nullptr;
   bool invert_iq = false;
+
+  // RC4 Registry - preload verified transponders
+  // T1: fingerprint 0x7C00 -> ID 9218321
+  // T2: fingerprint 0xC63F -> ID 5852921
+  g_rc4_registry.register_transponder(0x7C00, 9218321);
+  g_rc4_registry.register_transponder(0xC63F, 5852921);
 
   // process command line arguments
   for (int i = 1; i < argc; ++i) {

@@ -22,6 +22,7 @@ set(OPENSTINT_SOURCES
     passing.cpp
     counters.cpp
     sdr_device.cpp
+    rc4_registry.cpp
 )
 
 # Add SDR backend sources based on options

@@ -1,4 +1,5 @@
 #include "transponder.hpp"
+#include "rc4_registry.hpp"
 
 #include <bit>
 #include <string>
@@ -123,34 +124,28 @@ int decode_legacy(const uint8_t *softbits, uint32_t *transponder_id) {
 
 int decode_rc4(const uint8_t *softbits, uint32_t *transponder_id) {
   // RC4 Fingerprint-based decoder
-  // Instead of decoding the actual ID (which is scrambled with unknown PN),
-  // we extract a fingerprint from the raw softbits. Each transponder produces
-  // a unique fingerprint that can be matched via registration.
+  // Extracts fingerprint from raw softbits and looks up in registry.
 
   // Convert first 16 softbits to hard bits (threshold at 0x80)
-  // This forms a 16-bit fingerprint unique to each transponder
-  uint16_t fingerprint = 0;
-  for (int i = 0; i < 16; i++) {
-    fingerprint <<= 1;
-    if (softbits[i] >= 0x80) {
-      fingerprint |= 1;
-    }
+  uint16_t fingerprint = extract_rc4_fingerprint(softbits);
+
+  // Try to look up in registry
+  auto registered_id = g_rc4_registry.lookup(fingerprint);
+
+  if (registered_id.has_value()) {
+    // Found in registry - return the registered transponder ID
+    *transponder_id = registered_id.value();
+    std::fprintf(stderr,
+                 "[RC4] Detected transponder ID %u (fingerprint 0x%04X)\n",
+                 *transponder_id, fingerprint);
+    return 1; // Success - valid transponder ID
+  } else {
+    // Not registered - output fingerprint for registration
+    *transponder_id = static_cast<uint32_t>(fingerprint);
+    std::fprintf(stderr, "[RC4] Unregistered fingerprint: 0x%04X\n",
+                 fingerprint);
+    return 0; // Return 0 to indicate unregistered (no lap counting)
   }
-
-  // Use fingerprint as the "transponder ID" for now
-  // A more sophisticated system would look up fingerprint in a registration
-  // table
-  *transponder_id = static_cast<uint32_t>(fingerprint);
-
-  // Diagnostic output
-  std::fprintf(stderr,
-               "[DEBUG] RC4 Fingerprint: 0x%04X (binary: ", fingerprint);
-  for (int i = 15; i >= 0; i--) {
-    std::fprintf(stderr, "%d", (fingerprint >> i) & 1);
-  }
-  std::fprintf(stderr, ")\n");
-
-  return 1;
 }
 
 TransponderProps transponder_props(TransponderType t) {
